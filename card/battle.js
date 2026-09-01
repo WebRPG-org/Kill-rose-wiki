@@ -1,3 +1,19 @@
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js';
+import { getDatabase, onValue, ref, runTransaction, set } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-database.js';
+
+const firebaseConfig = {
+    apiKey: 'AIzaSyDsAReuxuTmRT6mPi8HRZcxNYaJvBDCR0g',
+    authDomain: 'cardgametest-8b285.firebaseapp.com',
+    databaseURL: 'https://cardgametest-8b285-default-rtdb.asia-southeast1.firebasedatabase.app',
+    projectId: 'cardgametest-8b285',
+    storageBucket: 'cardgametest-8b285.firebasestorage.app',
+    messagingSenderId: '760889130742',
+    appId: '1:760889130742:web:c71ab18fffcde76853f6d7'
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const database = getDatabase(firebaseApp);
+
 // ===== ゲーム状態管理(オンライン同期用の基盤) =====
 const gameState = {
     players: [
@@ -18,7 +34,8 @@ const gameState = {
     selectedFieldCell: null,
     selectedFieldPosition: null,
     usedSupporterThisTurn: false,
-    selectedFieldMonster: null
+    selectedFieldMonster: null,
+    winner: null
 };
 
 // 日本語変換マップ
@@ -86,10 +103,12 @@ let placementPanelView = 'self';
 
 const networkState = {
     connected: false,
-    socket: null,
     roomId: null,
     playerId: null,
     playerNumber: null,
+    roomRef: null,
+    unsubscribe: null,
+    receivingState: false
 };
 
 const handledActionIds = new Set();
@@ -132,91 +151,92 @@ function isMyTurn() {
     return gameState.currentPlayer === 1;
 }
 
-function sendOnlineMessage(payload) {
-    if (!networkState.connected || !networkState.socket) return;
-    try {
-        networkState.socket.send(JSON.stringify(payload));
-    } catch (error) {
-        console.error('WebSocket送信エラー:', error);
-    }
+function isPlayerTwoView() {
+    return networkState.playerNumber === 2;
 }
 
-function connectOnline(roomId, playerId) {
-    const host = location.host || 'localhost:3000';
-    const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${protocol}://${host}/ws`;
+function toLocalState(state) {
+    if (!isPlayerTwoView()) return state;
+    return { ...state, players: [state.players[1], state.players[0]], currentPlayer: state.currentPlayer === 1 ? 0 : 1 };
+}
 
-    networkState.roomId = roomId;
+function toSharedState(state) {
+    if (!isPlayerTwoView()) return state;
+    return { ...state, players: [state.players[1], state.players[0]], currentPlayer: state.currentPlayer === 1 ? 0 : 1 };
+}
+
+function createSharedState() {
+    const state = toSharedState(gameState);
+    return {
+        ...state,
+        selectedCard: null,
+        selectedCardSource: null,
+        selectedFieldCell: null,
+        selectedFieldPosition: null,
+        selectedFieldMonster: null,
+        handZoneMode: 'hand',
+        opponentHandView: false,
+        mulliganSelected: [],
+        privateLogs: []
+    };
+}
+
+async function connectOnline(roomId, playerId) {
+    const normalizedRoomId = roomId.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    const playerNumber = parsePlayerNumber(playerId);
+
+    if (!normalizedRoomId || !playerNumber) {
+        updateOnlineStatus('部屋名とプレイヤー番号を確認してください');
+        return;
+    }
+
+    if (networkState.unsubscribe) networkState.unsubscribe();
+
+    networkState.roomId = normalizedRoomId;
     networkState.playerId = normalizePlayerId(playerId);
-    networkState.playerNumber = parsePlayerNumber(playerId);
+    networkState.playerNumber = playerNumber;
+    networkState.roomRef = ref(database, `cardRooms/${normalizedRoomId}`);
     networkState.connected = false;
-
     updateOnlineStatus('接続中...');
 
-    const socket = new WebSocket(url);
-    networkState.socket = socket;
-
-    socket.addEventListener('open', () => {
+    try {
+        await runTransaction(networkState.roomRef, current => current || { state: createSharedState(), players: {} });
+        networkState.unsubscribe = onValue(networkState.roomRef, snapshot => {
+            const room = snapshot.val();
+            if (!room?.state) return;
+            networkState.receivingState = true;
+            Object.assign(gameState, toLocalState(room.state));
+            networkState.receivingState = false;
+            updateOnlinePlayers(Object.keys(room.players || {}).sort());
+            renderUI();
+        }, error => {
+            console.error('Firebase同期エラー:', error);
+            networkState.connected = false;
+            updateOnlineStatus('接続エラー');
+        });
         networkState.connected = true;
-        sendOnlineMessage({ type: 'JOIN', roomId, playerId });
-        updateOnlineStatus(`接続済み (${playerId})`);
-    });
-
-    socket.addEventListener('message', event => {
-        receiveOnlineMessage(event);
-    });
-
-    socket.addEventListener('close', () => {
-        networkState.connected = false;
-        updateOnlineStatus('切断済み');
-    });
-
-    socket.addEventListener('error', () => {
-        networkState.connected = false;
+        await set(ref(database, `cardRooms/${normalizedRoomId}/players/${networkState.playerId}`), true);
+        updateOnlineStatus(`接続済み (${networkState.playerId})`);
+    } catch (error) {
+        console.error('Firebase接続エラー:', error);
         updateOnlineStatus('接続エラー');
-    });
+    }
 }
 
-function receiveOnlineMessage(event) {
-    try {
-        const payload = JSON.parse(event.data);
-        if (payload.type === 'JOINED') {
-            updateOnlineStatus(`接続済み (${payload.playerId})`);
-            networkState.playerId = payload.playerId;
-            if (payload.playerNumber) {
-                networkState.playerNumber = payload.playerNumber;
-            }
-        }
-        if (payload.type === 'PLAYER_LIST') {
-            updateOnlinePlayers(payload.players);
-        }
-        if (payload.type === 'PLAYER_ACTION' && payload.action) {
-            const action = payload.action;
-            if (!handledActionIds.has(action.id)) {
-                action.remote = true;
-                executeAction(action);
-            }
-        }
-        if (payload.type === 'GAME_STATE_SYNC' && payload.state) {
-            Object.assign(gameState, payload.state);
-            renderUI();
-        }
-        if (payload.type === 'ERROR') {
-            console.error('サーバーエラー:', payload.message);
-            updateOnlineStatus(`エラー: ${payload.message}`);
-        }
-    } catch (error) {
-        console.error('オンライン受信エラー', error);
-    }
+function receiveOnlineMessage() {
+    // FirebaseのonValueで状態を受け取るため、この関数は互換用です。
+}
+
+function sendOnlineMessage() {
+    // Firebaseの同期では個別メッセージを使用しません。
 }
 
 function sendGameState() {
-    if (!networkState.connected || !networkState.socket) return;
-    const payload = {
-        type: 'GAME_STATE_SYNC',
-        state: gameState
-    };
-    sendOnlineMessage(payload);
+    if (!networkState.connected || !networkState.roomRef || networkState.receivingState) return;
+    set(ref(database, `cardRooms/${networkState.roomId}/state`), createSharedState()).catch(error => {
+        console.error('Firebase状態保存エラー:', error);
+        updateOnlineStatus('同期エラー');
+    });
 }
 
 function isAdjacentFieldPosition(currentPos, targetPos) {
@@ -325,11 +345,13 @@ function hidePlacementPanel() {
 }
 
 // 対象選択モーダルを表示
-function showTargetSelection(title, callback) {
+function showTargetSelection(title, callback, options = {}) {
     const modal = document.getElementById('targetModal');
     const modalTitle = document.getElementById('targetModalTitle');
     const targetGrid = document.getElementById('targetGrid');
     const confirmBtn = document.getElementById('targetConfirmBtn');
+    const allowReserve = options.allowReserve !== false;
+    const allowDirect = options.allowDirect !== false;
     
     modalTitle.textContent = title;
     targetGrid.innerHTML = '';
@@ -342,11 +364,16 @@ function showTargetSelection(title, callback) {
         const zone = i < 3 ? 'バトル' : '控え';
         const pos = (i % 3) + 1;
         cell.textContent = `${zone}${pos}`;
+
+        if (zone === '控え' && !allowReserve) {
+            cell.classList.add('disabled');
+        }
         
         cell.addEventListener('click', () => {
+            if (cell.classList.contains('disabled')) return;
             document.querySelectorAll('.target-cell').forEach(c => c.classList.remove('selected'));
             cell.classList.add('selected');
-            selectedTarget = `相手${zone}ゾーン${pos}`;
+            selectedTarget = { playerIndex: 0, zone: i < 3 ? 'battle' : 'reserve', index: i % 3 };
             confirmBtn.disabled = false;
         });
         
@@ -357,10 +384,12 @@ function showTargetSelection(title, callback) {
     directCell.className = 'target-cell';
     directCell.textContent = '直接攻撃';
     directCell.style.gridColumn = 'span 3';
+    if (!allowDirect) directCell.classList.add('disabled');
     directCell.addEventListener('click', () => {
+        if (directCell.classList.contains('disabled')) return;
         document.querySelectorAll('.target-cell').forEach(c => c.classList.remove('selected'));
         directCell.classList.add('selected');
-        selectedTarget = '相手プレイヤー';
+        selectedTarget = { playerIndex: 0, direct: true };
         confirmBtn.disabled = false;
     });
     targetGrid.appendChild(directCell);
@@ -379,6 +408,70 @@ function showTargetSelection(title, callback) {
 // 翻訳関数
 function translate(key, value) {
     return translations[key]?.[value] || value;
+}
+
+function hasMonstersOnField(playerIndex) {
+    const field = gameState.players[playerIndex].field;
+    return [...field.battle, ...field.reserve].some(monster => monster !== null);
+}
+
+function drawCardForPlayer(playerIndex) {
+    const player = gameState.players[playerIndex];
+    if (player.deck.length === 0) return null;
+
+    const drawnCard = player.deck.shift();
+    player.hand.push(drawnCard);
+    return drawnCard;
+}
+
+function destroyMonster(playerIndex, zone, index) {
+    const player = gameState.players[playerIndex];
+    const monster = player.field[zone][index];
+    if (!monster) return;
+
+    player.field[zone][index] = null;
+    monster.currentDamage = 0;
+    player.graveyard.push(monster);
+    gameState.logs.push({
+        type: 'system',
+        message: `${monster.card.cardName}が破壊され、墓地へ送られました`,
+        time: Date.now()
+    });
+
+    if (player.shield > 0) {
+        player.shield--;
+        const drawnCard = drawCardForPlayer(playerIndex);
+        gameState.logs.push({
+            type: 'system',
+            message: `${player.id}のシールドが1減少しました${drawnCard ? '。カードを1枚ドローしました' : ''}`,
+            time: Date.now()
+        });
+    }
+}
+
+function dealDamageToMonster(playerIndex, zone, index, amount) {
+    const monster = gameState.players[playerIndex].field[zone][index];
+    if (!monster) return false;
+
+    monster.currentDamage = Math.max(0, (monster.currentDamage || 0) + amount);
+    const damageText = amount >= 0 ? `${amount}ダメージ` : `${-amount}回復`;
+    gameState.logs.push({
+        type: 'system',
+        message: `${monster.card.cardName}に${damageText}を与えました(累積: ${monster.currentDamage})`,
+        time: Date.now()
+    });
+
+    if (monster.card.hp !== undefined && monster.currentDamage >= monster.card.hp) {
+        destroyMonster(playerIndex, zone, index);
+    }
+    return true;
+}
+
+function resetAttacksForPlayer(playerIndex) {
+    const field = gameState.players[playerIndex].field;
+    [...field.battle, ...field.reserve].forEach(monster => {
+        if (monster) monster.hasAttacked = false;
+    });
 }
 
 // カード画像のパスを取得
@@ -470,6 +563,11 @@ function renderUI() {
     const isMyTurn = isMyTurn();
     
     const statusValues = document.querySelectorAll('.status-value');
+    const statusLabels = document.querySelectorAll('.status-label');
+    const opponentId = gameState.players[0].id;
+    const playerId = gameState.players[1].id;
+    statusLabels[0].textContent = `${opponentId} HP:`;
+    statusLabels[3].textContent = `${playerId} HP:`;
     statusValues[0].textContent = gameState.players[0].hp;
     statusValues[1].textContent = gameState.players[0].shield;
     statusValues[2].textContent = `${gameState.players[0].mana}/${gameState.players[0].maxMana}`;
@@ -1250,14 +1348,10 @@ document.getElementById('targetCancelBtn').addEventListener('click', () => {
 // アクションを実行
 function executeAction(action) {
     if (!action) return;
+    if (gameState.winner && action.type !== 'CHAT') return;
     if (!action.id) action.id = generateActionId();
     if (handledActionIds.has(action.id)) return;
     handledActionIds.add(action.id);
-
-    if (!action.remote && networkState.connected) {
-        sendOnlineMessage({ type: 'PLAYER_ACTION', action });
-        sendGameState();
-    }
 
     const isMyTurn = isMyTurn();
     
@@ -1672,6 +1766,8 @@ function executeAction(action) {
                     
                     executeAction({ type: 'DRAW' });
                 }
+
+                resetAttacksForPlayer(1);
                 
                 gameState.logs.push({
                     type: 'system',
@@ -1697,31 +1793,48 @@ function executeAction(action) {
         case 'APPLY_DAMAGE':
             const zone = action.cellIndex < 3 ? 'battle' : 'reserve';
             const index = action.cellIndex % 3;
-            const monster = gameState.players[1].field[zone][index];
-            
-            if (monster && monster.currentDamage !== undefined) {
-                monster.currentDamage += action.value;
-                
-                const damageText = action.value > 0 ? `${action.value}ダメージ` : `${-action.value}回復`;
-                gameState.logs.push({
-                    type: 'system',
-                    message: `${monster.card.cardName}に${damageText}を与えました(累積: ${monster.currentDamage})`,
-                    time: Date.now()
-                });
-                
-                if (monster.card.hp && monster.currentDamage >= monster.card.hp) {
-                    gameState.logs.push({
-                        type: '1P',
-                        message: `${monster.card.cardName}の累積ダメージ(${monster.currentDamage})がHP(${monster.card.hp})を超えました`,
-                        time: Date.now()
-                    });
-                }
-                
+            if (dealDamageToMonster(1, zone, index, action.value)) {
                 document.getElementById('counterValue').value = 0;
             }
             break;
+
+        case 'NORMAL_ATTACK': {
+            const attackerPosition = action.attacker;
+            const target = action.target;
+            const attacker = attackerPosition && gameState.players[1].field[attackerPosition.zone]?.[attackerPosition.index];
+
+            if (!isMyTurn || !attacker || attackerPosition.zone !== 'battle' || attacker.hasAttacked || gameState.isFirstPlayerFirstTurn) break;
+
+            if (target?.direct) {
+                if (hasMonstersOnField(0)) break;
+
+                const opponent = gameState.players[0];
+                if (opponent.shield > 0) {
+                    opponent.shield--;
+                    drawCardForPlayer(0);
+                    gameState.logs.push({ type: '1P', message: `${attacker.card.cardName}が直接攻撃し、2Pのシールドを1減らしました`, time: Date.now() });
+                } else {
+                    opponent.hp--;
+                    gameState.logs.push({ type: '1P', message: `${attacker.card.cardName}が直接攻撃し、2Pに1ダメージを与えました`, time: Date.now() });
+                    if (opponent.hp <= 0) {
+                        gameState.winner = '1P';
+                        gameState.logs.push({ type: 'system', message: '1Pの勝利です', time: Date.now() });
+                    }
+                }
+            } else if (target?.playerIndex === 0 && target.zone === 'battle') {
+                if (!gameState.players[0].field.battle[target.index]) break;
+                dealDamageToMonster(0, 'battle', target.index, Number(attacker.card.attack) || 0);
+                gameState.logs.push({ type: '1P', message: `${attacker.card.cardName}が通常攻撃しました`, time: Date.now() });
+            } else {
+                break;
+            }
+
+            attacker.hasAttacked = true;
+            break;
+        }
     }
     renderUI();
+    if (!action.remote) sendGameState();
 }
 
 function shuffleDeck(playerIndex, zone = 'deck') {
@@ -2098,21 +2211,26 @@ function updateActionPanel(source) {
     if (source === 'field' && gameState.selectedFieldMonster) {
         const monster = gameState.selectedFieldMonster;
         const card = monster.card;
+        const canAttack = isMyTurn
+            && gameState.selectedFieldPosition?.zone === 'battle'
+            && !monster.hasAttacked
+            && !gameState.isFirstPlayerFirstTurn
+            && !gameState.winner;
         
         const attackBtn = document.createElement('button');
         attackBtn.className = 'action-btn';
         attackBtn.textContent = '通常攻撃';
-        attackBtn.disabled = !isMyTurn;
+        attackBtn.disabled = !canAttack;
         attackBtn.addEventListener('click', () => {
+            const canDirectAttack = !hasMonstersOnField(0);
             showTargetSelection('通常攻撃', (target) => {
-                gameState.logs.push({
-                    type: '1P',
-                    message: `${card.cardName}で${target}に通常攻撃しました`,
-                    time: Date.now()
+                executeAction({
+                    type: 'NORMAL_ATTACK',
+                    attacker: { ...gameState.selectedFieldPosition },
+                    target
                 });
                 clearAfterAction();
-                renderUI();
-            });
+            }, { allowReserve: false, allowDirect: canDirectAttack });
         });
         actionPanel.appendChild(attackBtn);
         
