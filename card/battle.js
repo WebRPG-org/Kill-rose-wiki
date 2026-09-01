@@ -560,7 +560,7 @@ function displayCardDetail(card, source) {
 
 // UIを更新
 function renderUI() {
-    const isMyTurn = isMyTurn();
+    const playerTurn = isMyTurn();
     
     const statusValues = document.querySelectorAll('.status-value');
     const statusLabels = document.querySelectorAll('.status-label');
@@ -575,7 +575,7 @@ function renderUI() {
     statusValues[4].textContent = gameState.players[1].shield;
     statusValues[5].textContent = `${gameState.players[1].mana}/${gameState.players[1].maxMana}`;
     
-    const turnText = isMyTurn ? 'あなたのターン' : '相手のターン';
+    const turnText = playerTurn ? 'あなたのターン' : '相手のターン';
     document.getElementById('turnStatus').textContent = `${gameState.turn} - ${turnText}`;
 
     const logDisplay = document.getElementById('logDisplay');
@@ -620,7 +620,7 @@ function renderUI() {
     renderField();
     updateMenuButtons();
     updateCounterApplyButton();
-    updateUIInteractivity(isMyTurn);
+    updateUIInteractivity(playerTurn);
 }
 
 // カード表示
